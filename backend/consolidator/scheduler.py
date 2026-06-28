@@ -68,15 +68,25 @@ class ConsolidationScheduler:
         log.info("Scheduled consolidation triggered")
         await self.engine.run(triggered_by="scheduler")
 
-    async def trigger_on_session_end(self, session_id: str) -> None:
-        """
-        Lightweight consolidation triggered immediately after a session ends.
-        Activates pending memories from the session; full scan deferred to cron.
+    async def trigger_on_session_end(self, session_id: str) -> int:
+        """Lightweight session-end pass: activate all pending memories.
+
+        The full four-phase scan runs on the cron schedule.
         """
         log.info("Session-end consolidation triggered", session_id=session_id[:8])
-        await self.store.activate_pending_memories(session_id)
-        # Run a targeted contradiction check for the new session's memories only
-        # (full scan runs on cron schedule to avoid latency impact)
+        activated = await self.store.activate_all_pending_memories()
+        log.info("Session-end activation complete", activated=activated)
+        return activated
+
+    def status(self) -> dict:
+        """Scheduler health for GET /consolidation/status."""
+        job = self._scheduler.get_job("consolidation_scheduled") if self._running else None
+        next_run = getattr(job, "next_run_time", None) if job else None
+        return {
+            "running": self._running,
+            "cron": os.getenv("CONSOLIDATION_CRON", "*/30 * * * *"),
+            "next_run_at": next_run.isoformat() if next_run else None,
+        }
 
     async def trigger_manual(self) -> dict:
         """Manually trigger a full consolidation run (via API endpoint)."""

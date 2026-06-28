@@ -1,10 +1,39 @@
-**/node_modules
-**/dist
-**/build
-**/coverage
-**/logs
-**/tmp
-**/.env
-**/pycache
-**/.next
-/out
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Env
+.env
+.env.local
+*.env
+
+# Data (never commit)
+*.db
+chroma_store/
+engram_eval_*/
+/backend/evals/report.json
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Local notes / working docs (not part of the submission)
+notes/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+*.log

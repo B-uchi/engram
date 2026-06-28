@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - ACTIVE_MODEL=qwen3-32b
+      - ACTIVE_THINKING=false
+      - CONSOLIDATOR_MODEL=qwen3-32b
+      - CONSOLIDATOR_THINKING=true
+      - DB_PATH=/data/db/engram.db
+      - CHROMA_PATH=/data/chroma
+      - SKILLS_PATH=/data/skills
+      - CONSOLIDATION_CRON=*/30 * * * *
+      - DECAY_DEPRECATE_THRESHOLD=0.06
+      - CONTEXT_BUDGET_TOKENS=4000
+      - ALLOWED_ORIGINS=http://localhost:3000,https://engram.vercel.app
+      - PORT=8000
+    volumes:
+      - engram_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  engram_data:
+    driver: local

@@ -147,7 +147,7 @@ class PlaybookStep(Base):
 
     id = Column(String(36), primary_key=True, default=new_id)
     memory_id = Column(String(36), ForeignKey("memories.id"), nullable=False, index=True)
-    playbook_id = Column(String(36), nullable=False, index=True)  # Groups steps into a workflow
+    playbook_id = Column(String(36), ForeignKey("playbooks.id"), nullable=False, index=True)
 
     step_number = Column(Integer, nullable=False)
     title = Column(String(255), nullable=False)
@@ -211,6 +211,13 @@ class Playbook(Base):
 
     __table_args__ = (
         UniqueConstraint("name", "version", name="uq_playbook_name_version"),
+        # At most one ACTIVE playbook per name; deprecated versions are exempt.
+        Index(
+            "uq_playbook_name_active",
+            "name",
+            unique=True,
+            sqlite_where=(status == MemoryStatus.ACTIVE),
+        ),
     )
 
     def __repr__(self) -> str:

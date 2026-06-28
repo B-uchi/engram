@@ -142,11 +142,14 @@ async def start_session(req: StartSessionRequest):
     Start a new session. Optionally pre-loads a playbook and primes
     the context with relevant memories.
     """
-    session = await store.create_session()
-
     playbook = None
     if req.playbook_name:
         playbook = await store.get_playbook(req.playbook_name)
+
+    # Link the session to the loaded playbook so run count / averages update.
+    session = await store.create_session(
+        playbook_id=playbook["id"] if playbook else None
+    )
 
     # Prime context — load relevant memories even before first message
     initial_memories = await active_agent.get_session_context(
@@ -278,18 +281,20 @@ async def query_memory(req: QueryMemoryRequest):
 
 @app.get("/memory/all")
 async def get_all_memories():
-    """Returns all memories (active + pending) for the memory graph visualization."""
-    memories = await store.get_all_active_memories()
+    """Active + pending + deprecated memories for the graph (includes superseded_by)."""
+    memories = await store.get_all_memories_for_graph()
     return {
         "memories": [
             {
                 "id": m.id,
-                "content": m.content[:150],
+                "content": m.content,
                 "memory_type": m.memory_type,
                 "status": m.status,
                 "importance_score": m.importance_score,
                 "recency_score": m.recency_score,
                 "access_count": m.access_count,
+                "superseded_by": m.superseded_by,
+                "deprecated_reason": m.deprecated_reason,
                 "created_at": m.created_at.isoformat(),
             }
             for m in memories
@@ -332,6 +337,12 @@ async def get_consolidation_history():
     return {"runs": runs}
 
 
+@app.get("/consolidation/status")
+async def get_consolidation_status():
+    """Report whether the Forgetting Engine scheduler is running and when it next fires."""
+    return scheduler.status()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Eval / metrics routes (for the learning curve visualization)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,9 +372,9 @@ async def get_summary_metrics():
         if total_sessions > 0 else 0
     )
 
-    # Calculate improvement: compare first third vs last third of sessions
+    # Improvement: first third vs last third (2 sessions → session 1 vs session 2).
     improvement = None
-    if total_sessions >= 3:
+    if total_sessions >= 2:
         third = max(1, total_sessions // 3)
         early = sessions[:third]
         late = sessions[-third:]
@@ -373,6 +384,7 @@ async def get_summary_metrics():
             improvement = round((1 - late_tokens / early_tokens) * 100, 1)
 
     last_run = runs[0] if runs else None
+    hygiene = await store.get_hygiene_counts()
 
     return {
         "total_sessions": total_sessions,
@@ -383,11 +395,35 @@ async def get_summary_metrics():
         "token_efficiency_improvement_pct": improvement,
         "active_memories": sum(1 for m in memories if m.status == "active"),
         "pending_memories": sum(1 for m in memories if m.status == "pending"),
+        "belief_revisions": hygiene["belief_revisions"],
+        "duplicates_merged": hygiene["duplicates_merged"],
+        "decayed": hygiene["decayed"],
         "last_consolidation": last_run["completed_at"] if last_run else None,
         "total_contradictions_resolved": sum(
             r.get("contradictions_resolved", 0) for r in runs
         ) if runs else 0,
     }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Demo seed route
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SeedRequest(BaseModel):
+    force: bool = False
+
+
+@app.post("/demo/seed")
+async def seed_demo_route(req: SeedRequest):
+    """
+    Populate the store with a realistic 3-session workflow demo.
+    Shows learning curve + contradiction in the UI immediately.
+    Pass force=true to re-seed.
+    """
+    from api.demo_seed import seed_demo as _seed
+    result = await _seed(store, force=req.force)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

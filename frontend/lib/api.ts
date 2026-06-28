@@ -88,6 +88,8 @@ export interface Memory {
   recency_score: number;
   access_count: number;
   relevance_score?: number;
+  superseded_by?: string | null;
+  deprecated_reason?: string | null;
   created_at: string;
 }
 
@@ -173,16 +175,30 @@ export interface SummaryMetrics {
   token_efficiency_improvement_pct: number | null;
   active_memories: number;
   pending_memories: number;
+  belief_revisions: number;
+  duplicates_merged: number;
+  decayed: number;
   last_consolidation: string | null;
   total_contradictions_resolved: number;
 }
 
 // ── SSE chat stream helper ─────────────────────────────────────────────────
 
+export interface ChatStreamEvent {
+  type: "chunk" | "done" | "error" | "tool_call" | "tool_result";
+  content?: string;
+  error?: string;
+  tool?: string;
+  name?: string;
+  arguments?: string;
+  ok?: boolean;
+  call_index?: number;
+}
+
 export async function* streamChat(
   sessionId: string,
   message: string
-): AsyncGenerator<{ type: string; content?: string; error?: string }> {
+): AsyncGenerator<ChatStreamEvent> {
   const res = await fetch(`${BASE}/sessions/${sessionId}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import dashscope
 import structlog
 from qwen_agent.llm import get_chat_model
 
@@ -104,6 +105,11 @@ Respond with ONLY a JSON array. No preamble.
 class ForgettingEngine:
     def __init__(self, store: MemoryStore):
         self.store = store
+        # DashScope keys are region-bound; our account is International (Singapore).
+        # The SDK defaults to the China endpoint, which rejects intl keys.
+        dashscope.base_http_api_url = os.getenv(
+            "DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/api/v1"
+        )
         self._llm_cfg = {
             "model": os.getenv("CONSOLIDATOR_MODEL", "qwen3-32b"),
             "model_type": "qwen_dashscope",
@@ -111,6 +117,9 @@ class ForgettingEngine:
                 "enable_thinking": True,   # Thinking mode for deep reasoning
                 "top_p": 0.9,
                 "max_input_tokens": 58000,  # Consolidator gets more context
+                # Match Qwen-Agent's cumulative-streaming assumption — the intl
+                # endpoint otherwise defaults to delta streaming. See active.py.
+                "incremental_output": False,
             },
         }
         self._llm = get_chat_model(self._llm_cfg)
@@ -119,7 +128,7 @@ class ForgettingEngine:
             os.getenv("DECAY_ARCHIVE_THRESHOLD", "0.15")
         )
         self._decay_deprecate_threshold = float(
-            os.getenv("DECAY_DEPRECATE_THRESHOLD", "0.05")
+            os.getenv("DECAY_DEPRECATE_THRESHOLD", "0.06")
         )
 
     async def run(self, triggered_by: str = "scheduler") -> ConsolidationRun:
@@ -157,9 +166,16 @@ class ForgettingEngine:
             playbooks_updated = await self._review_playbooks(run, diffs)
             run.playbooks_updated = playbooks_updated
 
+            run.memories_deprecated = sum(
+                1 for d in diffs if d.get("action") == "deprecated"
+            ) + sum(
+                len(d.get("source_ids", [])) for d in diffs if d.get("action") == "merged"
+            )
+
             run.completed_at = utcnow()
             run.diff_json = json.dumps(diffs)
             run.memories_scanned = len(await self.store.get_all_active_memories())
+            self._attach_diff_rows(run, diffs)
 
         except Exception as e:
             run.error = str(e)
@@ -178,6 +194,30 @@ class ForgettingEngine:
             contradictions=run.contradictions_resolved,
         )
         return run
+
+    def _attach_diff_rows(self, run: ConsolidationRun, diffs: list) -> None:
+        """Persist each diff dict as a MemoryDiff row (cascade-saved with the run)."""
+        for d in diffs:
+            memory_id = (
+                d.get("memory_id")
+                or d.get("new_memory_id")
+                or d.get("kept_id")
+                or (d.get("source_ids") or [None])[0]
+            )
+            if not memory_id:
+                continue
+            run.diffs.append(
+                MemoryDiff(
+                    id=new_id(),
+                    memory_id=memory_id,
+                    action=d.get("action", "updated"),
+                    reason=d.get("reason", ""),
+                    before_content=d.get("before_content"),
+                    after_content=d.get("after_content")
+                    or d.get("merged_content")
+                    or d.get("content_preview"),
+                )
+            )
 
     async def _activate_pending(
         self, run: ConsolidationRun, diffs: list
@@ -233,12 +273,19 @@ class ForgettingEngine:
 
         async with self.store._session() as db:
             for memory in active:
-                age_days = (now - memory.created_at).total_seconds() / 86400
-                days_since_access = (
-                    (now - memory.last_accessed_at).total_seconds() / 86400
-                    if memory.last_accessed_at
-                    else age_days
-                )
+                created_at = memory.created_at
+                if created_at.tzinfo is None:
+                    from datetime import timezone as _tz
+                    created_at = created_at.replace(tzinfo=_tz.utc)
+                age_days = (now - created_at).total_seconds() / 86400
+                if memory.last_accessed_at:
+                    laa = memory.last_accessed_at
+                    if laa.tzinfo is None:
+                        from datetime import timezone as _tz2
+                        laa = laa.replace(tzinfo=_tz2.utc)
+                    days_since_access = (now - laa).total_seconds() / 86400
+                else:
+                    days_since_access = age_days
 
                 # Recency: exponential decay, half-life 30 days
                 import math
@@ -270,8 +317,7 @@ class ForgettingEngine:
                         "access_count": memory.access_count,
                         "importance": memory.importance_score,
                     })
-                else:
-                    await db.merge(memory)  # Persist updated recency_score
+                await db.merge(memory)  # Persist status change AND recency_score update
 
             await db.commit()
 
@@ -285,7 +331,11 @@ class ForgettingEngine:
         Batches memories to stay within the LLM context limit.
         """
         all_memories = await self.store.get_all_active_memories()
-        active = [m for m in all_memories if m.status == MemoryStatus.ACTIVE]
+        # Facts only — procedural memories are handled by playbook versioning/review.
+        active = [
+            m for m in all_memories
+            if m.status == MemoryStatus.ACTIVE and m.memory_type != MemoryType.PROCEDURAL
+        ]
 
         if len(active) < 2:
             return 0, 0
@@ -326,7 +376,7 @@ class ForgettingEngine:
         response_text = ""
 
         try:
-            for chunk in self._llm.chat(messages=messages, stream=False):
+            for chunk in self._llm.chat(messages=messages, stream=True):
                 for msg in chunk:
                     if isinstance(msg, dict) and msg.get("role") == "assistant":
                         content = msg.get("content", "")
@@ -374,18 +424,21 @@ class ForgettingEngine:
 
                 if deprecated_id and winner_id:
                     try:
-                        await self.store.deprecate_memory(
+                        result = await self.store.deprecate_memory(
                             memory_id=deprecated_id,
                             reason=f"CONTRADICTION: {reason}",
                             superseded_by_id=winner_id,
                         )
-                        diffs.append({
-                            "action": "deprecated",
-                            "memory_id": deprecated_id,
-                            "superseded_by": winner_id,
-                            "reason": reason,
-                        })
-                        resolved += 1
+                        if result is None:
+                            log.warning("Contradiction target not found", id=deprecated_id)
+                        else:
+                            diffs.append({
+                                "action": "deprecated",
+                                "memory_id": deprecated_id,
+                                "superseded_by": winner_id,
+                                "reason": reason,
+                            })
+                            resolved += 1
                     except Exception as e:
                         log.error("Failed to deprecate", id=deprecated_id, error=str(e))
 
@@ -398,17 +451,20 @@ class ForgettingEngine:
                 for dep_id in deprecated_ids:
                     if dep_id and dep_id != kept_id:
                         try:
-                            await self.store.deprecate_memory(
+                            result = await self.store.deprecate_memory(
                                 memory_id=dep_id,
                                 reason=f"REDUNDANT: {reason}",
                                 superseded_by_id=kept_id,
                             )
-                            diffs.append({
-                                "action": "deprecated",
-                                "memory_id": dep_id,
-                                "reason": f"Merged into {kept_id}: {reason}",
-                            })
-                            resolved += 1
+                            if result is None:
+                                log.warning("Redundant target not found", id=dep_id)
+                            else:
+                                diffs.append({
+                                    "action": "deprecated",
+                                    "memory_id": dep_id,
+                                    "reason": f"Merged into {kept_id}: {reason}",
+                                })
+                                resolved += 1
                         except Exception as e:
                             log.error("Failed to deprecate redundant", id=dep_id, error=str(e))
 
@@ -429,8 +485,7 @@ class ForgettingEngine:
                                 importance_score=0.7,
                                 summary=merged_content[:200],
                             )
-                            # Activate it immediately (it's from the consolidator)
-                            new_mem.activate()
+                            await self.store.activate_memory(new_mem.id)
 
                             for src_id in source_ids:
                                 await self.store.deprecate_memory(
@@ -464,10 +519,10 @@ class ForgettingEngine:
             if not playbook:
                 continue
 
-            # Find steps with concerning failure rates
+            # Flag failing steps, but only after >= 3 executions.
             stale_steps = [
                 s for s in playbook["steps"]
-                if s["success_rate"] < 0.5 and (s["success_rate"] + 1) > 2  # At least 3 attempts
+                if s.get("attempts", 0) >= 3 and s["success_rate"] < 0.5
             ]
 
             if not stale_steps:

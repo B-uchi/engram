@@ -11,10 +11,15 @@ chromadb==0.6.3
 sqlalchemy==2.0.36
 aiosqlite==0.20.0
 
+# Embeddings
+openai==1.57.0
+
 # Text processing & retrieval
 rank-bm25==0.2.2
-tiktoken==0.8.0
 numpy==1.26.4
+
+# Audio (required by qwen-agent)
+soundfile==0.12.1
 
 # Async & scheduling
 apscheduler==3.10.4
@@ -29,3 +34,4 @@ rich==13.9.4
 pytest==8.3.4
 pytest-asyncio==0.24.0
 pytest-cov==6.0.0
+nest_asyncio==1.6.0
